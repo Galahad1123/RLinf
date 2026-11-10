@@ -50,7 +50,11 @@ class IsaaclabStackCubeEnv(IsaaclabBaseEnv):
 
             from isaaclab.app import AppLauncher
 
-            sim_app = AppLauncher(headless=True, enable_cameras=True).app
+            sim_app = AppLauncher(
+                headless=True, enable_cameras=True,
+                experience=os.environ.get("EVOWORLD_ISAAC_EXPERIENCE", ""),
+                kit_args=os.environ.get("EVOWORLD_ISAAC_KIT_ARGS", ""),
+            ).app
             from isaaclab_tasks.utils import load_cfg_from_registry
 
             isaac_env_cfg = load_cfg_from_registry(
