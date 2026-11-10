@@ -12,8 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 import logging
+import math
 import os
+import time
+from pathlib import Path
 from typing import TYPE_CHECKING, Optional, Union
 
 from omegaconf.dictconfig import DictConfig
@@ -41,6 +45,9 @@ class SFTRunner:
     ) -> None:
         self.cfg = cfg
         self.actor = actor
+        deadline = cfg.runner.get("deadline_unix", None)
+        if deadline is not None and (not math.isfinite(deadline) or deadline <= 0):
+            raise ValueError("runner.deadline_unix must be a finite positive Unix time")
 
         # this timer checks if we should stop training
         self.run_timer = run_timer
@@ -77,6 +84,11 @@ class SFTRunner:
 
     def run(self) -> None:
         start_step = self.global_step
+        started = time.time()
+        if self._deadline_exceeded():
+            raise TimeoutError("SFT deadline already expired; refusing a new update")
+        step_seconds = []
+        stop_reason = "max_steps"
         global_pbar = tqdm(
             initial=start_step,
             total=self.max_steps,
@@ -94,19 +106,23 @@ class SFTRunner:
 
                 self.global_step += 1
 
+                deadline_exceeded = self._deadline_exceeded()
                 eval_model, save_model, _ = check_progress(
                     self.global_step,
                     self.max_steps,
                     self.cfg.runner.val_check_interval,
                     self.cfg.runner.save_interval,
                     1.0,
-                    run_time_exceeded=False,
+                    run_time_exceeded=deadline_exceeded,
                 )
 
+                if deadline_exceeded:
+                    eval_model = False
+                    stop_reason = "deadline"
                 if save_model:
                     self._save_checkpoint()
 
-                should_stop = False
+                should_stop = deadline_exceeded
                 if eval_model:
                     eval_handle: Handle = self.actor.run_eval()
                     eval_metrics = eval_handle.wait()
@@ -120,6 +136,7 @@ class SFTRunner:
 
             time_metrics = self.timer.consume_durations()
             time_metrics["training"] = actor_handle.consume_duration()
+            step_seconds.append(time_metrics["step"])
             if eval_model:
                 time_metrics["evaluate"] = eval_handle.consume_duration()
             time_metrics = {f"time/{k}": v for k, v in time_metrics.items()}
@@ -146,6 +163,14 @@ class SFTRunner:
             global_pbar.set_postfix(logging_metrics, refresh=False)
             global_pbar.update(1)
             if should_stop:
+                if not deadline_exceeded:
+                    stop_reason = "early_stop"
+                break
+            # Validation/checkpoint I/O may have crossed the deadline.
+            if self._deadline_exceeded():
+                if not save_model and self.cfg.runner.save_interval > 0:
+                    self._save_checkpoint()
+                stop_reason = "deadline"
                 break
 
         if self.early_stop is not None and self.early_stop.best_val_acc > 0:
@@ -153,6 +178,30 @@ class SFTRunner:
                 f"Early stopping triggered! Best val_acc: {self.early_stop.best_val_acc:.4f}"
             )
         self.metric_logger.finish()
+        global_pbar.close()
+        if self.cfg.runner.get("write_training_status", False):
+            directory = (
+                Path(self.cfg.runner.logger.log_path)
+                / self.cfg.runner.logger.experiment_name
+            )
+            directory.mkdir(parents=True, exist_ok=True)
+            report = {
+                "global_step": self.global_step,
+                "start_step": start_step,
+                "max_steps": self.max_steps,
+                "stop_reason": stop_reason,
+                "started": started,
+                "finished": time.time(),
+                "step_seconds": step_seconds,
+            }
+            temporary = directory / "training_status.json.tmp"
+            temporary.write_text(json.dumps(report, indent=2))
+            temporary.replace(directory / "training_status.json")
+
+    def _deadline_exceeded(self) -> bool:
+        """Check the shared wall-clock deadline without resetting it on resume."""
+        deadline = self.cfg.runner.get("deadline_unix", None)
+        return deadline is not None and time.time() >= deadline
 
     def run_eval(self) -> None:
         with self.timer("evaluate"):
@@ -191,7 +240,17 @@ class SFTRunner:
             )
         actor_save_path = os.path.join(base_output_dir, "actor")
         os.makedirs(actor_save_path, exist_ok=True)
+        marker = Path(base_output_dir) / "checkpoint_complete.json"
+        marker.unlink(missing_ok=True)
         self.actor.save_checkpoint(actor_save_path, self.global_step).wait()
+        weights = Path(actor_save_path) / "model_state_dict/full_weights.pt"
+        record = {
+            "global_step": self.global_step,
+            "full_weights_bytes": weights.stat().st_size if weights.is_file() else None,
+        }
+        temporary = marker.with_suffix(".json.tmp")
+        temporary.write_text(json.dumps(record))
+        temporary.replace(marker)
         if is_best and self.early_stop is not None:
             logger.info(
                 f"Saved best model (val_acc={self.early_stop.best_val_acc:.4f}) to {base_output_dir}"

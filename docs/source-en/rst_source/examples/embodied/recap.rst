@@ -423,6 +423,13 @@ The training script automatically initializes the Ray cluster:
       logs/value_sft/{config_name}-{timestamp}/value_sft/checkpoints/global_step_{N}/actor/model_state_dict
 
 
+Limit Training Time
+~~~~~~~~~~~~~~~~~~~
+
+To save before a job allocation ends, set ``runner.deadline_unix`` to a positive Unix timestamp in seconds. Both value and CFG training check this deadline at update boundaries, save the current checkpoint, and stop. Keep the same timestamp when resuming, and allow time after the deadline for checkpoint I/O and evaluation. A run started after the deadline raises ``TimeoutError`` before its first update. This is a graceful stop; blocked workers or storage can delay completion.
+
+Set ``runner.write_training_status: true`` to write ``training_status.json`` under the experiment log directory. It records ``global_step``, ``stop_reason`` and per-update ``step_seconds``. Use the reported step to locate the saved checkpoint when the deadline shortened training. The report is written only after the runner finishes successfully. The default configuration leaves both options disabled. Checkpoint saves write an atomic ``checkpoint_complete.json`` marker only after all workers finish; a failed overwrite invalidates the old marker. Keep ``runner.save_interval`` positive to save on deadline; a negative interval disables saves, including at the deadline.
+
 Step 3: Compute Advantages
 -----------------------------
 

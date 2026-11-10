@@ -415,6 +415,13 @@ Step 2：训练价值模型（Value Model SFT）
       logs/value_sft/{config_name}-{timestamp}/value_sft/checkpoints/global_step_{N}/actor/model_state_dict
 
 
+限制训练时间
+~~~~~~~~~~~~
+
+需要在作业时限前保存时，将 ``runner.deadline_unix`` 设为以秒为单位的正 Unix 时间戳。价值模型和 CFG 训练都会在更新边界检查截止时间，保存当前检查点后退出。恢复时保留同一时间戳，并在截止时间后预留检查点写入和评测时间。若启动时已经过期，训练器会在第一次更新前抛出 ``TimeoutError``。这是安全退出机制，worker 或存储阻塞仍可能延迟完成。
+
+设置 ``runner.write_training_status: true`` 后，实验日志目录下会生成 ``training_status.json``，记录 ``global_step``、``stop_reason`` 和逐步耗时 ``step_seconds``。若训练因时间限制提前结束，按报告中的实际步数查找检查点。报告仅在训练器正常结束后写入。默认配置不启用这两个选项。 检查点仅在所有 worker 保存成功后原子写入 ``checkpoint_complete.json`` 完成标记，覆盖保存失败会使旧标记失效。需要在截止时保存，请保持 ``runner.save_interval`` 为正；负值会禁用包括截止时在内的保存。
+
 Step 3：计算优势（Compute Advantages）
 -------------------------------------------
 
